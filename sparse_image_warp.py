@@ -176,9 +176,7 @@ def solve_interpolation(train_points, train_values, order, regularization_weight
 
     num_b_cols = matrix_b.shape[2]  # d + 1
 
-    # In Tensorflow, zeros are used here. Pytorch solve fails with zeros for some reason we don't understand.
-    # So instead we use very tiny randn values (variance of one, zero mean) on one side of our multiplication.
-    lhs_zeros = 0 * torch.randn((b, num_b_cols, num_b_cols), device=device) / 1e10
+    lhs_zeros = 0 * torch.randn((b, num_b_cols, num_b_cols), device=device)
     right_block = torch.cat((matrix_b, lhs_zeros), 1)  # [b, n + d + 1, d + 1]
     lhs = torch.cat((left_block, right_block), 2)  # [b, n + d + 1, n + d + 1]
 
@@ -396,9 +394,7 @@ def interpolate_bilinear(grid,
         alpha = torch.unsqueeze(alpha, 2)
         alphas.append(alpha)
 
-    # flattened_grid = torch.reshape(grid, [batch_size * height * width, channels]).squeeze(-1).expand(batch_size, -1)
     flattened_grid = grid.flatten(1,2)
-    # batch_offsets = torch.reshape(torch.arange(batch_size, device=grid_device) * height * width, [batch_size, 1])
 
     # This wraps array_ops.gather. We reshape the image data such that the
     # batch, y, and x coordinates are pulled into the first dimension.
