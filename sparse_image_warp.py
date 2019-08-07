@@ -27,22 +27,91 @@ SOFTWARE.
 """
 
 import random
-
 import torch
+import numpy as np
 
+
+def _get_boundary_locations(image_height, image_width, num_points_per_edge):
+    """Compute evenly-spaced indices along edge of image."""
+    y_range = np.linspace(0, image_height - 1, num_points_per_edge + 2)
+    x_range = np.linspace(0, image_width - 1, num_points_per_edge + 2)
+    ys, xs = np.meshgrid(y_range, x_range, indexing='ij')
+    is_boundary = np.logical_or(
+        np.logical_or(xs == 0, xs == image_width - 1),
+        np.logical_or(ys == 0, ys == image_height - 1))
+    return np.stack([ys[is_boundary], xs[is_boundary]], axis=-1)
+
+def _add_zero_flow_controls_at_boundary(control_point_locations,
+                                        control_point_flows, image_height,
+                                        image_width, boundary_points_per_edge):
+    """Add control points for zero-flow boundary conditions.
+    Augment the set of control points with extra points on the
+    boundary of the image that have zero flow.
+    Args:
+        control_point_locations: input control points
+        control_point_flows: their flows
+        image_height: image height
+        image_width: image width
+        boundary_points_per_edge: number of points to add in the middle of each
+                            edge (not including the corners).
+                            The total number of points added is
+                            4 + 4*(boundary_points_per_edge).
+    Returns:
+        merged_control_point_locations: augmented set of control point locations
+        merged_control_point_flows: augmented set of control point flows
+    """
+
+    batch_size = control_point_locations.shape[0]
+    device = control_point_locations.device
+    dtype = control_point_locations.dtype
+
+    boundary_point_locations = _get_boundary_locations(image_height,
+                                                       image_width,
+                                                       boundary_points_per_edge)
+    # Make it size bs * (4(boundary_points_per_edge + 1)) * 2
+    boundary_point_locations = torch.tensor(boundary_point_locations,
+                                            dtype=dtype,
+                                            device=device).expand(batch_size,
+                                                                  -1, -1)
+    boundary_point_flows = torch.zeros([batch_size, 
+                                        boundary_point_locations.shape[1], 2],
+                                       dtype=dtype, device=device)
+    merged_control_point_locations = torch.cat((control_point_locations,
+                                                boundary_point_locations),
+                                               dim=1)
+    merged_control_point_flows = torch.cat((control_point_flows,
+                                            boundary_point_flows),
+                                            dim=1)
+
+    return merged_control_point_locations, merged_control_point_flows
 
 def sparse_image_warp(img_tensor,
                       source_control_point_locations,
                       dest_control_point_locations,
                       interpolation_order=2,
                       regularization_weight=0.0,
-                      num_boundaries_points=0):
+                      num_boundary_points=0):
     device = img_tensor.device
+    source_control_point_locations = source_control_point_locations.to(device)
+    dest_control_point_locations = dest_control_point_locations.to(device)
     control_point_flows = dest_control_point_locations - source_control_point_locations
 
-    batch_size, image_height, image_width = img_tensor.shape
-    flattened_grid_locations = get_flat_grid_locations(image_height, image_width, device)
+    # If no channel dimension, add a channel dimension:
+    if img_tensor.dim() == 3:
+        img_tensor = img_tensor.unsqueeze(-1)
+    if img_tensor.dim() != 4:
+        raise ValueError('Source image must be in shape [batch_size, height, '
+                         + 'width, channels] or [batch_size, height, width]') 
+    batch_size, image_height, image_width, channels = img_tensor.shape
+    flattened_grid_locations = get_flat_grid_locations(image_height, image_width, device).expand(batch_size, -1, -1)
 
+    clamp_boundaries = num_boundary_points > 0
+    boundary_points_per_edge = num_boundary_points - 1
+    if clamp_boundaries:
+      (dest_control_point_locations,
+       control_point_flows) = _add_zero_flow_controls_at_boundary(
+           dest_control_point_locations, control_point_flows, image_height,
+           image_width, boundary_points_per_edge)
     flattened_flows = interpolate_spline(
         dest_control_point_locations,
         control_point_flows,
@@ -51,9 +120,7 @@ def sparse_image_warp(img_tensor,
         regularization_weight)
 
     dense_flows = create_dense_flows(flattened_flows, batch_size, image_height, image_width)
-
     warped_image = dense_image_warp(img_tensor, dense_flows)
-
     return warped_image, dense_flows
 
 
@@ -119,7 +186,7 @@ def solve_interpolation(train_points, train_values, order, regularization_weight
     rhs = torch.cat((f, rhs_zeros), 1)  # [b, n + d + 1, k]
 
     # Then, solve the linear system and unpack the results.
-    X, LU = torch.gesv(rhs, lhs)
+    X, LU = torch.solve(rhs, lhs)
     w = X[:, :n, :]
     v = X[:, n:, :]
 
@@ -139,7 +206,6 @@ def cross_squared_distance_matrix(x, y):
     """
     x_norm_squared = torch.sum(torch.mul(x, x), dim=-1).unsqueeze(2)
     y_norm_squared = torch.sum(torch.mul(y, y), dim=-1).unsqueeze(1)
-
     x_y_transpose = torch.bmm(x, y.transpose(1, 2))
 
     # squared_dists[b,i,j] = ||x_bi - y_bj||^2 = x_bi'x_bi- 2x_bi'x_bj + x_bj'x_bj
@@ -192,7 +258,6 @@ def apply_interpolation(query_points, train_points, w, v, order):
     Returns:
     Polyharmonic interpolation evaluated at points defined in query_points.
     """
-    query_points = query_points.unsqueeze(0)
     # First, compute the contribution from the rbf term.
     pairwise_dists = cross_squared_distance_matrix(query_points.float(), train_points.float())
     phi_pairwise_dists = phi(pairwise_dists, order)
@@ -237,7 +302,6 @@ def dense_image_warp(image, flow):
     ValueError: if height < 2 or width < 2 or the inputs have the wrong number
     of dimensions.
     """
-    image = image.unsqueeze(3)  # add a single channel dimension to image tensor
     batch_size, height, width, channels = image.shape
     device = image.device
 
@@ -313,6 +377,8 @@ def interpolate_bilinear(grid,
         maxx = torch.max(min_floor, torch.floor(queries))
         floor = torch.min(maxx, max_floor)
         int_floor = floor.long()
+        # Add channel dimension 
+        int_floor = int_floor.unsqueeze(-1).expand(-1, -1, channels)
         floors.append(int_floor)
         ceil = int_floor + 1
         ceils.append(ceil)
@@ -320,7 +386,7 @@ def interpolate_bilinear(grid,
         # alpha has the same type as the grid, as we will directly use alpha
         # when taking linear combinations of pixel values from the image.
 
-        alpha = torch.tensor((queries - floor), dtype=grid_type, device=grid_device)
+        alpha = (queries - floor).clone().type(grid_type).to(grid_device)
         min_alpha = torch.tensor(0.0, dtype=grid_type, device=grid_device)
         max_alpha = torch.tensor(1.0, dtype=grid_type, device=grid_device)
         alpha = torch.min(torch.max(min_alpha, alpha), max_alpha)
@@ -330,16 +396,18 @@ def interpolate_bilinear(grid,
         alpha = torch.unsqueeze(alpha, 2)
         alphas.append(alpha)
 
-    flattened_grid = torch.reshape(grid, [batch_size * height * width, channels])
-    batch_offsets = torch.reshape(torch.arange(batch_size, device=grid_device) * height * width, [batch_size, 1])
+    # flattened_grid = torch.reshape(grid, [batch_size * height * width, channels]).squeeze(-1).expand(batch_size, -1)
+    flattened_grid = grid.flatten(1,2)
+    # batch_offsets = torch.reshape(torch.arange(batch_size, device=grid_device) * height * width, [batch_size, 1])
 
     # This wraps array_ops.gather. We reshape the image data such that the
     # batch, y, and x coordinates are pulled into the first dimension.
     # Then we gather. Finally, we reshape the output back. It's possible this
     # code would be made simpler by using array_ops.gather_nd.
     def gather(y_coords, x_coords, name):
-        linear_coordinates = batch_offsets + y_coords * width + x_coords
-        gathered_values = torch.gather(flattened_grid.t(), 1, linear_coordinates)
+        # linear_coordinates = batch_offsets + y_coords * width + x_coords
+        linear_coordinates = y_coords * width + x_coords
+        gathered_values = torch.gather(flattened_grid, 1, linear_coordinates)
         return torch.reshape(gathered_values, [batch_size, num_queries, channels])
 
     # grab the pixel values in the 4 corners around each query point
@@ -402,6 +470,7 @@ def time_warp(spec, W=5):
     dist_to_warp = random.randrange(-W, W)
     src_pts, dest_pts = (torch.tensor([[[y, point_to_warp], [0, 0], [0, spec_len - 1], [num_rows - 1, 0], [num_rows - 1, spec_len - 1]]], device=device),
                          torch.tensor([[[y, point_to_warp + dist_to_warp], [0, 0], [0, spec_len - 1], [num_rows - 1, 0], [num_rows - 1, spec_len - 1]]], device=device))
+    return src_pts, dest_pts
     warped_spectro, dense_flows = sparse_image_warp(spec, src_pts, dest_pts)
     return warped_spectro.squeeze(3).squeeze(0)
 
